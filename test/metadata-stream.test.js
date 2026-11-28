@@ -20,8 +20,9 @@
   throws(block, [expected], [message])
 */
 
-var metadataStream, stringToInts, stringToCString, id3Tag, id3Frame, id3Generator, mp2t, QUnit,
-    webworkify, MetadataStreamTestWorker;
+var metadataStream, stringToInts, stringToCString, stringToUtf8Ints, id3Tag, id3Frame,
+    id3Generator, mp2t, QUnit, webworkify, MetadataStreamTestWorker,
+    id3v23TagWithExtendedHeader, id3v24Tag;
 
 mp2t = require('../lib/m2ts');
 QUnit = require('qunit');
@@ -29,8 +30,11 @@ id3Generator = require('./utils/id3-generator');
 MetadataStreamTestWorker = require('worker!./metadata-stream-test-worker.js').default;
 stringToInts = id3Generator.stringToInts;
 stringToCString = id3Generator.stringToCString;
+stringToUtf8Ints = id3Generator.stringToUtf8Ints;
 id3Tag = id3Generator.id3Tag;
 id3Frame = id3Generator.id3Frame;
+id3v23TagWithExtendedHeader = id3Generator.id3v23TagWithExtendedHeader;
+id3v24Tag = id3Generator.id3v24Tag;
 
 QUnit.module('MetadataStream', {
   beforeEach: function() {
@@ -729,4 +733,129 @@ QUnit.test('triggers special event after parsing a timestamp ID3 tag', function(
   assert.equal(frame.timeStamp, 900000, 'Initial timestamp fired and calculated correctly');
   assert.equal(tag.pts, 10 * 90e3, 'set tag PTS');
   assert.equal(tag.dts, 10 * 90e3, 'set tag DTS');
+});
+
+// helper: a TIT2 frame whose text is UTF-8 (encoding byte 3)
+function utf8Tit2Frame(title) {
+  return id3Frame('TIT2', [0x03].concat(stringToUtf8Ints(title)));
+}
+
+// ID3v2.4 extended header from the bug report: the size field says 6 but only
+// two header bytes (0x01, 0x00) follow
+var malformedV24ExtendedHeader = [
+  0x00, 0x00, 0x00, 0x06,
+  0x01,
+  0x00
+];
+
+QUnit.test('emits the TIT2 title from an ID3v2.4 tag with a size-6 extended header', function(assert) {
+  var tag = new Uint8Array(id3v24Tag(malformedV24ExtendedHeader, utf8Tit2Frame('夜场')));
+  var event = null;
+
+  metadataStream.on('data', function(t) {
+    event = t;
+  });
+  metadataStream.push({
+    type: 'timed-metadata',
+    dataAlignmentIndicator: true,
+    pts: 90000,
+    dts: 90000,
+    data: tag
+  });
+
+  assert.ok(event, 'parsed a metadata event');
+  assert.equal(event.frames.length, 1, 'parsed one frame');
+  assert.equal(event.frames[0].key, 'TIT2', 'parsed the TIT2 frame');
+  assert.equal(event.frames[0].value, '夜场', 'event title is 夜场, not empty');
+  assert.equal(event.pts, 90000, 'pts stays 90000');
+  assert.equal(event.dts, 90000, 'dts stays 90000');
+});
+
+QUnit.test('parses a changed title from the same ID3v2.4 extended header layout', function(assert) {
+  var tag = new Uint8Array(id3v24Tag(malformedV24ExtendedHeader, utf8Tit2Frame('返场')));
+  var event = null;
+
+  metadataStream.on('data', function(t) {
+    event = t;
+  });
+  metadataStream.push({
+    type: 'timed-metadata',
+    dataAlignmentIndicator: true,
+    pts: 90000,
+    dts: 90000,
+    data: tag
+  });
+
+  assert.equal(event.frames[0].value, '返场', 'event title is 返场');
+  assert.equal(event.pts, 90000, 'pts stays 90000');
+});
+
+QUnit.test('keeps parsing an ID3v2.3 tag with an extended header', function(assert) {
+  var tag = new Uint8Array(id3v23TagWithExtendedHeader(utf8Tit2Frame('夜场')));
+  var event = null;
+
+  metadataStream.on('data', function(t) {
+    event = t;
+  });
+  metadataStream.push({
+    type: 'timed-metadata',
+    dataAlignmentIndicator: true,
+    pts: 90000,
+    dts: 90000,
+    data: tag
+  });
+
+  assert.equal(event.frames[0].key, 'TIT2', 'parsed the TIT2 frame');
+  assert.equal(event.frames[0].value, '夜场', '2.3 title stays 夜场');
+  assert.equal(event.pts, 90000, 'pts stays 90000');
+});
+
+QUnit.test('keeps parsing an ID3v2.4 tag without an extended header', function(assert) {
+  var tag = new Uint8Array(id3v24Tag(null, utf8Tit2Frame('返场')));
+  var event = null;
+
+  metadataStream.on('data', function(t) {
+    event = t;
+  });
+  metadataStream.push({
+    type: 'timed-metadata',
+    dataAlignmentIndicator: true,
+    pts: 90000,
+    dts: 90000,
+    data: tag
+  });
+
+  assert.equal(event.frames[0].key, 'TIT2', 'parsed the TIT2 frame');
+  assert.equal(event.frames[0].value, '返场', 'title stays 返场');
+  assert.equal(event.pts, 90000, 'pts stays 90000');
+});
+
+QUnit.test('parses the same ID3v2.4 tag identically on a second push', function(assert) {
+  var tag = new Uint8Array(id3v24Tag(malformedV24ExtendedHeader, utf8Tit2Frame('夜场')));
+  var events = [];
+
+  metadataStream.on('data', function(t) {
+    events.push(t);
+  });
+
+  metadataStream.push({
+    type: 'timed-metadata',
+    dataAlignmentIndicator: true,
+    pts: 90000,
+    dts: 90000,
+    data: tag
+  });
+  metadataStream.push({
+    type: 'timed-metadata',
+    dataAlignmentIndicator: true,
+    pts: 90000,
+    dts: 90000,
+    data: tag
+  });
+
+  assert.equal(events.length, 2, 'emitted two events');
+  assert.equal(events[0].frames[0].value, '夜场', 'first event title is 夜场');
+  assert.equal(events[1].frames[0].value, '夜场', 'second event title is still 夜场');
+  assert.equal(events[0].pts, 90000, 'first event pts is 90000');
+  assert.equal(events[1].pts, 90000, 'second event pts is still 90000');
 });
